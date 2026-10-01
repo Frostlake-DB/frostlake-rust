@@ -20,20 +20,51 @@
 mod http;
 mod json;
 #[cfg(test)]
+mod session_tests;
+#[cfg(test)]
 mod test_support;
 
 use std::fmt;
+use std::time::Duration;
 
 pub use json::Value;
 
 #[derive(Debug)]
 pub struct Error {
     message: String,
+    kind: ErrorKind,
+}
+
+/// Which family an [`Error`] belongs to, which is what decides what a caller
+/// can do about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ErrorKind {
+    /// The engine no longer holds the connection's session — it expired, was
+    /// released, or the server restarted — and the statement was NOT run,
+    /// because it depended on something that went with the session: an open
+    /// transaction, or context set up on it (`USE`, `SET`, `ALTER SESSION` or a
+    /// temporary object). The connection stays usable, and its next statement
+    /// starts a fresh session on the DSN's scope; after a transaction begun with
+    /// [`Connection::begin`], once `commit` or `rollback` has ended it.
+    SessionLost,
+    /// Every other failure: the engine refused the statement, the request never
+    /// became an answer, or the answer could not be read.
+    Other,
 }
 
 impl Error {
     fn new(message: impl Into<String>) -> Error {
-        Error { message: message.into() }
+        Error { message: message.into(), kind: ErrorKind::Other }
+    }
+
+    fn session_lost(message: &str) -> Error {
+        Error { message: message.to_string(), kind: ErrorKind::SessionLost }
+    }
+
+    /// Which family the failure belongs to.
+    pub fn kind(&self) -> ErrorKind {
+        self.kind
     }
 }
 
@@ -51,10 +82,18 @@ impl From<std::io::Error> for Error {
     }
 }
 
+/// One column's metadata, as the server described it.
 #[derive(Debug, Clone)]
 pub struct Column {
     pub name: String,
     pub data_type: Option<String>,
+    /// A text column's width in characters, or a binary column's in bytes —
+    /// the number the account's own driver reports as such a column's precision
+    /// and its display size. `VARCHAR(9)` carries 9 and `BINARY(5)` carries 5;
+    /// one declared without a width carries the maximum instead, 16777216
+    /// characters or 8388608 bytes. `None` for every other type, and for a
+    /// server that predates the field: absent, never a width of 0.
+    pub length: Option<i64>,
 }
 
 /// One statement's outcome: `rows` are indexed positionally and read by column
@@ -89,6 +128,16 @@ pub fn connect(dsn: &str) -> Result<Connection, Error> {
     Ok(conn)
 }
 
+/// How long closing may spend releasing the engine session.
+const CLOSE_BUDGET: Duration = Duration::from_secs(5);
+
+// What the `SessionLost` errors say went with the session.
+const LOST_TRANSACTION: &str = "the engine no longer holds this connection's session (it expired, was released, or the server restarted), so its open transaction is gone; the statement did not run";
+const LOST_CONTEXT: &str = "the engine no longer holds this connection's session (it expired, was released, or the server restarted), and the context set up on it (USE, SET, ALTER SESSION or a temporary object) went with it, so the statement was not re-run; the next statement starts a fresh session on the connection's scope";
+const LOST_FRESH: &str = "the engine refused a session it had just started; the statement did not run";
+const LOST_TX_STATEMENT: &str = "the transaction went with the connection's session, which the engine no longer holds; the statement did not run, and the transaction can only be rolled back";
+const LOST_COMMIT: &str = "the transaction went with the connection's session, which the engine no longer holds, so nothing was committed";
+
 #[derive(Debug)]
 pub struct Connection {
     host: String,
@@ -97,6 +146,45 @@ pub struct Connection {
     auto_commit: bool,
     closed: bool,
     pending_use: Vec<String>,
+    /// The DSN's scope: the `USE` statements a fresh session needs, in order.
+    scope: Vec<String>,
+    /// Whether the engine reports `newSession`, which arrived together with
+    /// `requireSession` and `DELETE /api/sessions/{id}`. `None` until the first
+    /// answer that names a session.
+    tracks_sessions: Option<bool>,
+    /// Set once a statement left context on the session that a fresh one on the
+    /// DSN's scope would not have, so a lost session is reported rather than
+    /// replaced. Putting the scope on a fresh session clears it.
+    holds_context: bool,
+    /// Whether a transaction is open on the session, from `BEGIN` or `START
+    /// TRANSACTION` until `COMMIT` or `ROLLBACK`.
+    in_transaction: bool,
+    /// Set when the session was lost under a transaction begun with `begin`:
+    /// statements are refused until `commit` or `rollback` ends it.
+    transaction_lost: bool,
+    /// How long closing may spend releasing the session.
+    close_budget: Duration,
+}
+
+/// What one request to `/api/execute` came to.
+enum Posted {
+    Answered {
+        out: Value,
+        /// The engine ran the request in a fresh session in place of the one
+        /// that was sent, which only an engine not asked to require it does.
+        replaced: bool,
+    },
+    /// The engine refused the session it was required to resume, as one it no
+    /// longer holds: nothing ran.
+    SessionGone,
+}
+
+/// What a statement does to the session's transaction.
+#[derive(Debug, PartialEq, Eq)]
+enum TransactionEffect {
+    Begins,
+    Ends,
+    NoEffect,
 }
 
 impl Connection {
@@ -171,8 +259,19 @@ impl Connection {
             session_id: None,
             auto_commit: true,
             closed: false,
+            scope: pending_use.clone(),
             pending_use,
+            tracks_sessions: None,
+            holds_context: false,
+            in_transaction: false,
+            transaction_lost: false,
+            close_budget: CLOSE_BUDGET,
         })
+    }
+
+    /// The engine's id for this connection's session, once an answer has named one.
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
     }
 
     fn ping(&mut self) -> Result<(), Error> {
@@ -186,52 +285,286 @@ impl Connection {
 
     /// Executes one statement, inlining `?` placeholders from `binds` in order.
     pub fn execute(&mut self, sql: &str, binds: &[Value]) -> Result<QueryResult, Error> {
+        self.execute_with_multi_statement_count(sql, binds, None)
+    }
+
+    /// [`execute`](Connection::execute) with `multi_statement_count` declared on
+    /// this one request: how many statements `sql` holds, `Some(0)` for any
+    /// number. The engine refuses a pack whose count differs, as the account
+    /// does. The count travels with the request alone and outranks the session's
+    /// `MULTI_STATEMENT_COUNT` without changing it, so nothing needs restoring
+    /// afterwards; `None` sends no count and leaves the session's value in charge.
+    pub fn execute_with_multi_statement_count(
+        &mut self,
+        sql: &str,
+        binds: &[Value],
+        multi_statement_count: Option<i64>,
+    ) -> Result<QueryResult, Error> {
         if self.closed {
             return Err(Error::new("connection is closed"));
         }
-        // A failed USE stays queued, so every later statement keeps failing
-        // instead of silently running against the server's default database.
-        while !self.pending_use.is_empty() {
-            let statement = self.pending_use[0].clone();
-            self.round_trip(&statement)?;
-            self.pending_use.remove(0);
+        if self.transaction_lost {
+            return Err(Error::session_lost(LOST_TX_STATEMENT));
         }
+        self.apply_scope()?;
         let rendered = if binds.is_empty() {
             sql.to_string()
         } else {
             substitute(sql, binds)?
         };
-        let out = self.round_trip(&rendered)?;
+        let out = match self.post(&rendered, multi_statement_count)? {
+            Posted::Answered { out, .. } => out,
+            Posted::SessionGone => self.recover(&rendered, multi_statement_count)?,
+        };
+        self.track(&rendered);
         Ok(shape_result(&out))
     }
 
     pub fn begin(&mut self) -> Result<(), Error> {
+        // A transaction that went with a lost session is given up by starting another.
+        self.transaction_lost = false;
         self.auto_commit = false;
         // A BEGIN that fails opened no transaction, so autocommit stays on.
         if let Err(e) = self.execute("BEGIN", &[]) {
             self.auto_commit = true;
+            self.transaction_lost = false;
             return Err(e);
         }
         Ok(())
     }
 
+    /// Commits the transaction `begin` opened. One that went with a lost session
+    /// cannot be: that is a `SessionLost` error, and nothing is sent — a COMMIT in a
+    /// fresh session would report a success that never happened.
     pub fn commit(&mut self) -> Result<(), Error> {
-        self.execute("COMMIT", &[])?;
-        self.auto_commit = true;
-        Ok(())
+        if self.transaction_lost {
+            self.transaction_lost = false;
+            self.auto_commit = true;
+            return Err(Error::session_lost(LOST_COMMIT));
+        }
+        match self.execute("COMMIT", &[]) {
+            Ok(_) => {
+                self.auto_commit = true;
+                Ok(())
+            }
+            // The COMMIT found the session gone and did not run; the engine
+            // discarded the transaction with the session.
+            Err(e) if e.kind() == ErrorKind::SessionLost => {
+                self.transaction_lost = false;
+                self.auto_commit = true;
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
     }
 
+    /// Rolls back the transaction `begin` opened. One that went with a lost
+    /// session is already gone, so that succeeds without a round trip.
     pub fn rollback(&mut self) -> Result<(), Error> {
-        self.execute("ROLLBACK", &[])?;
-        self.auto_commit = true;
+        if self.transaction_lost {
+            self.transaction_lost = false;
+            self.auto_commit = true;
+            return Ok(());
+        }
+        match self.execute("ROLLBACK", &[]) {
+            Ok(_) => {
+                self.auto_commit = true;
+                Ok(())
+            }
+            // Found gone on the way: the transaction went with the session, which
+            // is all a rollback asks for.
+            Err(e) if e.kind() == ErrorKind::SessionLost => {
+                self.transaction_lost = false;
+                self.auto_commit = true;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Closes the connection, releasing the engine session with `DELETE
+    /// /api/sessions/{id}`, which also rolls back a transaction it left open.
+    /// Releasing is a courtesy: it is bounded by five seconds and never fails —
+    /// the engine reclaims an idle session by itself. An engine that predates
+    /// `newSession` has no such endpoint and is sent nothing, and neither is
+    /// anything sent by a second `close`. Dropping a connection closes it.
+    pub fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        self.release();
+    }
+
+    fn release(&mut self) {
+        let Some(session_id) = self.session_id.take() else { return };
+        self.in_transaction = false;
+        if self.tracks_sessions != Some(true) {
+            return;
+        }
+        let path = format!("/api/sessions/{}", percent_encode(&session_id));
+        let _ =
+            http::request_bounded(&self.host, self.port, "DELETE", &path, None, self.close_budget);
+    }
+
+    /// Runs the DSN's queued `USE` statements. A failed one stays queued, so
+    /// every later statement keeps failing instead of silently running against
+    /// the server's default database. Each is one statement of its own, whatever
+    /// the caller's request declares.
+    ///
+    /// A session found gone while its scope goes back on is replaced by a fresh
+    /// one, which takes the whole scope from its first statement: nothing ran,
+    /// and the scope is exactly what a fresh session needs. Only a transaction
+    /// open on the lost session stands in the way, and is reported.
+    fn apply_scope(&mut self) -> Result<(), Error> {
+        let mut restarted = false;
+        while !self.pending_use.is_empty() {
+            let statement = self.pending_use[0].clone();
+            match self.post(&statement, None)? {
+                Posted::SessionGone => {
+                    // Putting the scope back resets the session's context anyway.
+                    self.holds_context = false;
+                    self.refuse_lost()?;
+                    if restarted {
+                        return Err(Error::session_lost(LOST_FRESH));
+                    }
+                    restarted = true;
+                }
+                // A fresh session took over part-way, and the whole scope is queued again.
+                Posted::Answered { replaced: true, .. } => {}
+                Posted::Answered { .. } => {
+                    self.pending_use.remove(0);
+                }
+            }
+        }
         Ok(())
     }
 
-    pub fn close(&mut self) {
-        self.closed = true;
+    /// Answers the engine's refusal of a session it no longer holds — it expired,
+    /// was released, or the server restarted — and nothing ran. With a
+    /// transaction or context gone with the session, re-running would put the
+    /// statement somewhere its author did not intend, so that is reported;
+    /// otherwise a fresh session on the DSN's scope takes over and the statement
+    /// is sent once more.
+    fn recover(&mut self, sql: &str, multi_statement_count: Option<i64>) -> Result<Value, Error> {
+        self.refuse_lost()?;
+        self.apply_scope()?;
+        match self.post(sql, multi_statement_count)? {
+            Posted::Answered { out, .. } => Ok(out),
+            Posted::SessionGone => {
+                self.drop_session();
+                Err(Error::session_lost(LOST_FRESH))
+            }
+        }
     }
 
-    fn round_trip(&mut self, sql: &str) -> Result<Value, Error> {
+    /// Drops a session the engine no longer holds, and reports the loss when it
+    /// held a transaction or context a statement may depend on.
+    fn refuse_lost(&mut self) -> Result<(), Error> {
+        let had_transaction = self.in_transaction;
+        let had_context = self.holds_context;
+        self.drop_session();
+        if had_transaction {
+            // A transaction `begin` opened stays refused until `commit` or
+            // `rollback` ends it: a statement run now would land in a fresh
+            // session, outside anything either of them decides.
+            self.transaction_lost = !self.auto_commit;
+            return Err(Error::session_lost(LOST_TRANSACTION));
+        }
+        if had_context {
+            return Err(Error::session_lost(LOST_CONTEXT));
+        }
+        Ok(())
+    }
+
+    /// Forgets the session, with everything tracked about it, and queues the
+    /// DSN's scope for the fresh session the next statement starts.
+    fn drop_session(&mut self) {
+        self.session_id = None;
+        self.pending_use = self.scope.clone();
+        self.holds_context = false;
+        self.in_transaction = false;
+    }
+
+    /// Learns from an answer that names a session. Whether it carries
+    /// `newSession` settles what the engine offers. A fresh session started in
+    /// place of the one that was sent — which only happens while
+    /// `requireSession` is not sent — means whatever the old one held is gone,
+    /// and the DSN's scope goes back on before the next statement. Reports
+    /// whether that happened.
+    fn absorb(&mut self, new_session: Option<bool>, sent_id: bool) -> bool {
+        let Some(started) = new_session else {
+            if self.tracks_sessions.is_none() {
+                self.tracks_sessions = Some(false);
+            }
+            return false;
+        };
+        self.tracks_sessions = Some(true);
+        if !started || !sent_id {
+            return false;
+        }
+        self.pending_use = self.scope.clone();
+        self.holds_context = false;
+        self.in_transaction = false;
+        true
+    }
+
+    /// Updates what the session holds from the text of a request that
+    /// succeeded. Every statement in it counts: a `USE` riding behind a leading
+    /// `SELECT` moves the session just the same.
+    fn track(&mut self, sql: &str) {
+        for statement in split_statements(sql) {
+            if touches_session(statement) {
+                self.holds_context = true;
+            }
+            match transaction_effect(statement) {
+                TransactionEffect::Begins => self.in_transaction = true,
+                TransactionEffect::Ends => self.in_transaction = false,
+                TransactionEffect::NoEffect => {}
+            }
+        }
+    }
+
+    /// One `POST /api/execute`, without any recovery.
+    fn post(&mut self, sql: &str, multi_statement_count: Option<i64>) -> Result<Posted, Error> {
+        let sent_id = self.session_id.is_some();
+        // Resume this session or refuse: without it the engine starts a fresh
+        // session under the same id when the old one has gone, and the statement
+        // runs in the wrong context. Only an engine known to offer it is asked,
+        // since an older one may refuse a field it does not know.
+        let require_session = sent_id && self.tracks_sessions == Some(true);
+        let (status, out) = self.round_trip(sql, multi_statement_count, require_session)?;
+        if status == 404
+            && require_session
+            && out.get("success").and_then(Value::as_bool) != Some(true)
+            && !matches!(out.get("sessionId"), Some(Value::Str(_)))
+        {
+            return Ok(Posted::SessionGone);
+        }
+        let mut replaced = false;
+        if let Some(Value::Str(session_id)) = out.get("sessionId") {
+            self.session_id = Some(session_id.clone());
+            let new_session = out.get("newSession").and_then(Value::as_bool);
+            replaced = self.absorb(new_session, sent_id);
+        }
+        if out.get("success").and_then(Value::as_bool) != Some(true) {
+            // Request validation answers {"error": …} rather than errorMessage.
+            let message = out
+                .get("errorMessage")
+                .and_then(Value::as_str)
+                .or_else(|| out.get("error").and_then(Value::as_str))
+                .unwrap_or("statement failed");
+            return Err(Error::new(message));
+        }
+        Ok(Posted::Answered { out, replaced })
+    }
+
+    fn round_trip(
+        &mut self,
+        sql: &str,
+        multi_statement_count: Option<i64>,
+        require_session: bool,
+    ) -> Result<(u16, Value), Error> {
         let mut payload = format!(
             "{{\"sql\":\"{}\",\"autoCommit\":{}",
             json::escape(sql),
@@ -239,6 +572,14 @@ impl Connection {
         );
         if let Some(session_id) = &self.session_id {
             payload.push_str(&format!(",\"sessionId\":\"{}\"", json::escape(session_id)));
+        }
+        if require_session {
+            payload.push_str(",\"requireSession\":true");
+        }
+        // Absent unless the caller asked for a count: a request without the field
+        // is the one the server has always seen, and the session's value decides.
+        if let Some(count) = multi_statement_count {
+            payload.push_str(&format!(",\"multiStatementCount\":{count}"));
         }
         payload.push('}');
         // Failed statements answer with a non-2xx status AND the error payload in the body.
@@ -250,19 +591,13 @@ impl Connection {
                 excerpt(&response.body, e.at)
             ))
         })?;
-        if let Some(Value::Str(session_id)) = out.get("sessionId") {
-            self.session_id = Some(session_id.clone());
-        }
-        if out.get("success").and_then(Value::as_bool) != Some(true) {
-            // Request validation answers {"error": …} rather than errorMessage.
-            let message = out
-                .get("errorMessage")
-                .and_then(Value::as_str)
-                .or_else(|| out.get("error").and_then(Value::as_str))
-                .unwrap_or("statement failed");
-            return Err(Error::new(message));
-        }
-        Ok(out)
+        Ok((response.status, out))
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -295,6 +630,7 @@ fn shape_result(out: &Value) -> QueryResult {
                 .map(|c| Column {
                     name: c.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
                     data_type: c.get("dataType").and_then(Value::as_str).map(str::to_string),
+                    length: c.get("length").and_then(Value::as_i128).map(|n| n as i64),
                 })
                 .collect()
         })
@@ -433,6 +769,143 @@ fn quote_ident(name: &str) -> String {
         name.to_string()
     } else {
         format!("\"{}\"", name.replace('"', "\"\""))
+    }
+}
+
+/// Escapes all but URL-unreserved bytes, so a session id travels as one path segment.
+fn percent_encode(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for b in text.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+// -- session tracking ---------------------------------------------------------
+
+/// Splits a request on its top-level semicolons, reading literals, quoted
+/// identifiers, `$$…$$` bodies and comments the way `substitute` does, so a
+/// semicolon inside one of them does not split. A scripting block is split
+/// along with everything else, which only makes the checks below more willing
+/// to flag a request — the safe direction to be wrong in.
+fn split_statements(sql: &str) -> Vec<&str> {
+    let bytes = sql.as_bytes();
+    let mut pieces = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\'' {
+            i = skip_string(bytes, i);
+        } else if c == b'"' {
+            i = skip_quoted(bytes, i);
+        } else if c == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            i = skip_line(bytes, i);
+        } else if c == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i = find_block_comment_end(bytes, i + 2);
+        } else if c == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            i = skip_line(bytes, i);
+        } else if c == b'$' && bytes.get(i + 1) == Some(&b'$') {
+            i = skip_dollar_quoted(bytes, i + 2);
+        } else if c == b';' {
+            pieces.push(&sql[start..i]);
+            i += 1;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    pieces.push(&sql[start..]);
+    pieces
+}
+
+fn is_word_byte(c: u8) -> bool {
+    c == b'_' || c == b'$' || c.is_ascii_alphanumeric()
+}
+
+/// Up to `limit` leading words of a statement, upper-cased, skipping whitespace
+/// and comments and stopping at the first thing that is not a word.
+fn leading_words(statement: &str, limit: usize) -> Vec<String> {
+    let bytes = statement.as_bytes();
+    let mut words = Vec::new();
+    let mut i = 0usize;
+    while words.len() < limit && i < bytes.len() {
+        let c = bytes[i];
+        let next = bytes.get(i + 1).copied();
+        if c.is_ascii_whitespace() {
+            i += 1;
+        } else if (c == b'-' && next == Some(b'-')) || (c == b'/' && next == Some(b'/')) {
+            i = skip_line(bytes, i);
+        } else if c == b'/' && next == Some(b'*') {
+            i = find_block_comment_end(bytes, i + 2);
+        } else if is_word_byte(c) {
+            let start = i;
+            while i < bytes.len() && is_word_byte(bytes[i]) {
+                i += 1;
+            }
+            words.push(statement[start..i].to_ascii_uppercase());
+        } else {
+            break;
+        }
+    }
+    words
+}
+
+/// The words that may sit between CREATE, DROP or ALTER and the kind of object
+/// being named.
+const MODIFIERS: [&str; 21] = [
+    "OR", "REPLACE", "TRANSIENT", "TEMPORARY", "TEMP", "VOLATILE", "LOCAL", "GLOBAL", "SECURE",
+    "IF", "NOT", "EXISTS", "PUBLIC", "PRIVATE", "ICEBERG", "DYNAMIC", "HYBRID", "EVENT",
+    "RECURSIVE", "MATERIALIZED", "EXTERNAL",
+];
+
+/// Whether a statement leaves context behind that a fresh session on the DSN's
+/// scope would not have: a moved scope (`USE`, `CREATE` or `DROP` of a
+/// `DATABASE` or `SCHEMA`), a session variable or setting (`SET`, `UNSET`,
+/// `ALTER SESSION`), or a temporary object. `CREATE TABLE` and its kind leave
+/// the session as it was.
+fn touches_session(statement: &str) -> bool {
+    let words = leading_words(statement, 16);
+    let Some((verb, rest)) = words.split_first() else {
+        return false;
+    };
+    match verb.as_str() {
+        "USE" | "SET" | "UNSET" => true,
+        "ALTER" | "CREATE" | "DROP" => {
+            let modifiers = rest.iter().take_while(|w| MODIFIERS.contains(&w.as_str())).count();
+            let object = rest.get(modifiers).map(String::as_str);
+            if verb == "ALTER" {
+                return object == Some("SESSION");
+            }
+            if matches!(object, Some("DATABASE" | "SCHEMA")) {
+                return true;
+            }
+            verb == "CREATE"
+                && rest[..modifiers]
+                    .iter()
+                    .any(|w| matches!(w.as_str(), "TEMPORARY" | "TEMP" | "VOLATILE"))
+        }
+        _ => false,
+    }
+}
+
+/// What a statement does to the session's transaction. `BEGIN` on its own, or
+/// with `TRANSACTION`, `WORK` or `NAME`, opens one, as does `START
+/// TRANSACTION`; `BEGIN` followed by a statement opens a scripting block
+/// instead. `COMMIT` and `ROLLBACK` end one.
+fn transaction_effect(statement: &str) -> TransactionEffect {
+    let words = leading_words(statement, 2);
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    match words.as_slice() {
+        ["BEGIN"] | ["BEGIN", "TRANSACTION" | "WORK" | "NAME"] | ["START", "TRANSACTION"] => {
+            TransactionEffect::Begins
+        }
+        ["COMMIT" | "ROLLBACK", ..] => TransactionEffect::Ends,
+        _ => TransactionEffect::NoEffect,
     }
 }
 
@@ -677,6 +1150,30 @@ mod tests {
     }
 
     #[test]
+    fn a_per_call_count_travels_only_with_the_request_that_asked_for_it() {
+        let ok = "{\"success\":true,\"sessionId\":\"s-1\",\"resultSets\":[]}";
+        let (port, server) = serve_script(vec![(200, ok), (200, ok), (200, ok), (200, ok)]);
+        let mut conn = Connection::new(&format!("frostlake://127.0.0.1:{port}")).unwrap();
+        conn.execute("SELECT 1", &[]).unwrap();
+        conn.execute_with_multi_statement_count("SELECT 1; SELECT 2", &[], Some(2)).unwrap();
+        conn.execute_with_multi_statement_count("SELECT 1; SELECT 2", &[], Some(0)).unwrap();
+        conn.execute_with_multi_statement_count("SELECT 1", &[], None).unwrap();
+        let seen = server.join().unwrap();
+        // A caller who asks for nothing sends no field at all, so the session's
+        // MULTI_STATEMENT_COUNT keeps deciding.
+        assert!(!seen[0].contains("multiStatementCount"), "{}", seen[0]);
+        assert!(seen[1].contains("\"multiStatementCount\":2"), "{}", seen[1]);
+        // 0 means any number, and is sent as written rather than read as absent.
+        assert!(seen[2].contains("\"multiStatementCount\":0"), "{}", seen[2]);
+        assert!(!seen[3].contains("multiStatementCount"), "{}", seen[3]);
+        // The count is a property of the request, never of the session: nothing
+        // alters session state to carry it.
+        for request in &seen {
+            assert!(!request.contains("ALTER SESSION"), "{request}");
+        }
+    }
+
+    #[test]
     fn a_failed_begin_leaves_autocommit_on() {
         let ok = "{\"success\":true,\"sessionId\":\"s-1\",\"resultSets\":[]}";
         let (port, server) =
@@ -862,8 +1359,8 @@ mod tests {
     fn column_lookup_prefers_exact_then_falls_back_case_insensitively() {
         let ambiguous = QueryResult {
             columns: vec![
-                Column { name: "n".to_string(), data_type: None },
-                Column { name: "N".to_string(), data_type: None },
+                Column { name: "n".to_string(), data_type: None, length: None },
+                Column { name: "N".to_string(), data_type: None, length: None },
             ],
             rows: vec![vec![Value::Int(1), Value::Int(2)]],
             row_count: 1,
@@ -873,7 +1370,7 @@ mod tests {
         assert_eq!(ambiguous.get(0, "missing"), None);
         assert_eq!(ambiguous.get(9, "n"), None);
         let single = QueryResult {
-            columns: vec![Column { name: "NAME".to_string(), data_type: None }],
+            columns: vec![Column { name: "NAME".to_string(), data_type: None, length: None }],
             rows: vec![vec![Value::Str("Ada".into())]],
             row_count: 1,
         };
@@ -892,6 +1389,22 @@ mod tests {
         let shaped = shape_result(&ragged);
         assert_eq!(shaped.rows, vec![vec![Value::Int(1), Value::Null]]);
         assert_eq!(shaped.row_count, 1);
+    }
+
+    #[test]
+    fn text_and_binary_columns_carry_their_declared_width() {
+        let answer = json::parse(
+            "{\"resultSets\":[{\"columns\":[{\"name\":\"S\",\"dataType\":\"VARCHAR\",\"length\":9},{\"name\":\"B\",\"dataType\":\"BINARY\",\"length\":5},{\"name\":\"N\",\"dataType\":\"NUMBER\",\"precision\":10,\"scale\":2},{\"name\":\"U\",\"dataType\":\"VARCHAR\",\"length\":16777216}],\"rows\":[]}]}",
+        )
+        .unwrap();
+        let shaped = shape_result(&answer);
+        // Characters for the text column, bytes for the binary one.
+        assert_eq!(shaped.columns[0].length, Some(9));
+        assert_eq!(shaped.columns[1].length, Some(5));
+        // A type that carries no width reports none rather than a width of 0.
+        assert_eq!(shaped.columns[2].length, None);
+        // Declared without a width, a text column still carries the maximum.
+        assert_eq!(shaped.columns[3].length, Some(16_777_216));
     }
 
     #[test]
@@ -978,5 +1491,91 @@ mod tests {
         );
         assert_eq!(convert(Value::Float(2.5), &double), Value::Float(2.5));
         assert_eq!(convert(Value::Str("n/a".into()), &float), Value::Str("n/a".into()));
+    }
+
+    #[test]
+    fn statements_that_leave_context_behind_are_recognised() {
+        for statement in [
+            "USE DATABASE x",
+            "use schema y",
+            "USE ROLE r",
+            "SET v = 1",
+            "UNSET v",
+            "ALTER SESSION SET TIMEZONE = 'UTC'",
+            "alter session unset timezone",
+            "CREATE DATABASE d",
+            "CREATE OR REPLACE DATABASE d",
+            "CREATE TRANSIENT DATABASE d",
+            "DROP DATABASE IF EXISTS d",
+            "CREATE SCHEMA IF NOT EXISTS s",
+            "DROP SCHEMA s",
+            // A temporary object lives exactly as long as its session.
+            "CREATE TEMPORARY TABLE t (a INT)",
+            "CREATE OR REPLACE TEMP TABLE t (a INT)",
+            "CREATE VOLATILE TABLE t (a INT)",
+            "CREATE TEMPORARY STAGE st",
+            "  -- comment\n  USE DATABASE x",
+            "/* c */ SET v = 1",
+        ] {
+            assert!(touches_session(statement), "{statement}");
+        }
+        for statement in [
+            "SELECT 1",
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET a = 1",
+            "CREATE TABLE t (a INT)",
+            "CREATE OR REPLACE TABLE t (a INT)",
+            "DROP TABLE t",
+            "DROP TEMPORARY TABLE t",
+            "CREATE VIEW v AS SELECT 1",
+            "ALTER TABLE t ADD COLUMN b INT",
+            "CREATE OR REPLACE FUNCTION f() RETURNS INT AS $$ 1 $$",
+            "BEGIN",
+            "COMMIT",
+            "SELECT 'USE DATABASE x'",
+            "",
+            "   ",
+        ] {
+            assert!(!touches_session(statement), "{statement}");
+        }
+    }
+
+    #[test]
+    fn transaction_boundaries_are_recognised() {
+        for (statement, effect) in [
+            ("BEGIN", TransactionEffect::Begins),
+            ("begin transaction", TransactionEffect::Begins),
+            ("BEGIN WORK", TransactionEffect::Begins),
+            ("BEGIN NAME t1", TransactionEffect::Begins),
+            ("START TRANSACTION", TransactionEffect::Begins),
+            ("  -- open\n BEGIN", TransactionEffect::Begins),
+            ("COMMIT", TransactionEffect::Ends),
+            ("commit work", TransactionEffect::Ends),
+            ("ROLLBACK", TransactionEffect::Ends),
+            ("SELECT 1", TransactionEffect::NoEffect),
+            ("", TransactionEffect::NoEffect),
+            ("START", TransactionEffect::NoEffect),
+            // BEGIN followed by a statement opens a scripting block, not a transaction.
+            ("BEGIN SELECT 1", TransactionEffect::NoEffect),
+            ("BEGIN\n  LET x := 1", TransactionEffect::NoEffect),
+        ] {
+            assert_eq!(transaction_effect(statement), effect, "{statement}");
+        }
+    }
+
+    #[test]
+    fn requests_split_on_their_top_level_semicolons() {
+        assert_eq!(split_statements("SELECT 1; USE SCHEMA s"), ["SELECT 1", " USE SCHEMA s"]);
+        for single in ["SELECT ';'", "SELECT \"a;b\"", "SELECT $$a;b$$", "SELECT 1 -- ;\n", "SELECT /* ; */ 1"] {
+            assert_eq!(split_statements(single), [single]);
+        }
+        // Every statement of a request is tracked, a USE behind a SELECT included.
+        assert!(split_statements("SELECT 1; USE SCHEMA s").iter().any(|s| touches_session(s)));
+    }
+
+    #[test]
+    fn a_session_id_is_escaped_into_one_path_segment() {
+        assert_eq!(percent_encode("0f3c-9a_b.c~d"), "0f3c-9a_b.c~d");
+        assert_eq!(percent_encode("a/b c?"), "a%2Fb%20c%3F");
     }
 }

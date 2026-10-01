@@ -55,6 +55,10 @@ fn full_driver_flow() {
     }
     let mut conn = conn.expect("server did not become healthy");
 
+    // Checks this engine cannot answer. Reported at the end rather than passed: a green
+    // tick would claim an engine had been checked for something it never reports.
+    let mut skipped: Vec<&str> = Vec::new();
+
     // DDL, DML and a typed query through binds.
     conn.execute("CREATE OR REPLACE DATABASE rs_test_db", &[]).unwrap();
     conn.execute("USE DATABASE rs_test_db", &[]).unwrap();
@@ -87,6 +91,29 @@ fn full_driver_flow() {
     assert_eq!(result.get(0, "NAME"), Some(&Value::Str("Ada O'Hara \\ Byron".into())));
     assert_eq!(result.get(0, "SCORE"), Some(&Value::Float(9.5)));
     assert_eq!(result.get(0, "OK"), Some(&Value::Bool(true)));
+
+    // A text or binary column carries the width it was declared with:
+    // characters for one, bytes for the other, and nothing at all for any
+    // other type.
+    conn.execute(
+        "CREATE TABLE widths (s VARCHAR(9), b BINARY(5), n NUMBER(10,2), u VARCHAR)",
+        &[],
+    )
+    .unwrap();
+    let widths = conn.execute("SELECT s, b, n, u FROM widths", &[]).unwrap();
+    // An engine that predates the field sends no width at all, and this driver
+    // supports those: with nothing to report the width checks are skipped rather
+    // than passed, so a green tick never claims a width the wire never carried.
+    if widths.columns[0].length.is_none() {
+        skipped.push("text and binary columns carry their declared width");
+    } else {
+        assert_eq!(widths.columns[0].length, Some(9));
+        assert_eq!(widths.columns[1].length, Some(5));
+        // Declared without a width, a text column still reports the maximum.
+        assert_eq!(widths.columns[3].length, Some(16_777_216));
+    }
+    // Nothing else carries a width at all: None, never Some(0).
+    assert_eq!(widths.columns[2].length, None);
 
     // Session state persists across statements (the table is unqualified).
     let seen = conn.execute("SELECT COUNT(*) AS n FROM people", &[]).unwrap();
@@ -194,8 +221,37 @@ fn full_driver_flow() {
         other => panic!("A = {other:?}"),
     }
 
+    // A pack may declare its own count instead, on the request alone — no ALTER
+    // SESSION anywhere, and the session's count is untouched by it.
+    let per_call = conn
+        .execute_with_multi_statement_count("SELECT 1 AS one; SELECT 2 AS two", &[], Some(2))
+        .unwrap();
+    assert_eq!(per_call.get(0, "ONE"), Some(&Value::Int(1)));
+    let any = conn
+        .execute_with_multi_statement_count("SELECT 3 AS three; SELECT 4 AS four", &[], Some(0))
+        .unwrap();
+    assert_eq!(any.get(0, "THREE"), Some(&Value::Int(3)));
+    // The session still counts one statement, so a pack that asks for nothing fails
+    // exactly as it did before any of this.
+    //
+    // Only an engine carrying the statement-count gate refuses a pack at all, and this
+    // driver supports older ones. Against one of those no refusal ever comes, so the
+    // checks are skipped rather than passed: a green tick would claim an engine had
+    // been checked for a refusal it does not make.
+    if conn.execute("SELECT 1 AS one; SELECT 2 AS two", &[]).is_ok() {
+        skipped.push("a pack nobody asked for is still refused");
+    } else {
+        assert!(conn.execute("SELECT 1 AS one; SELECT 2 AS two", &[]).is_err());
+        // Declaring a count the pack does not hold is refused, in either direction.
+        assert!(conn
+            .execute_with_multi_statement_count("SELECT 1", &[], Some(2))
+            .is_err());
+    }
+
     // A multi-statement request answers with several result sets; the driver
-    // surfaces the first, as documented.
+    // surfaces the first, as documented. The engine refuses a pack the caller did
+    // not ask for, so the session asks for any number first.
+    conn.execute("ALTER SESSION SET MULTI_STATEMENT_COUNT = 0", &[]).unwrap();
     let multi = conn.execute("SELECT 1 AS one; SELECT 2 AS two", &[]).unwrap();
     assert_eq!(multi.get(0, "ONE"), Some(&Value::Int(1)));
 
@@ -287,12 +343,25 @@ fn full_driver_flow() {
     assert_eq!(one.get(0, "F"), Some(&Value::Float(1.0)));
     assert_eq!(one.columns[0].data_type.as_deref(), Some("FLOAT"));
 
-    // A blank statement is refused by request validation, whose answer names
-    // the reason under `error` rather than `errorMessage`.
-    let blank = conn.execute("   ", &[]).unwrap_err();
-    assert_eq!(blank.to_string(), "SQL is required");
+    // A blank statement fails. Engines from 0.1.0 run it and fail it as the
+    // account does ("Empty SQL statement."); older ones refuse it in request
+    // validation, whose answer names the reason under `error`.
+    let blank = conn.execute("   ", &[]).unwrap_err().to_string();
+    assert!(
+        blank == "SQL is required" || blank.contains("Empty SQL statement."),
+        "{blank}"
+    );
 
     // The error surface carries the engine's message.
     let error = conn.execute("SELECT FROM nowhere", &[]).unwrap_err();
     assert!(error.to_string().contains("SQL compilation error"), "{error}");
+
+    if !skipped.is_empty() {
+        eprintln!(
+            "\nintegration: {} check(s) skipped, this engine reports nothing to check them \
+             against — {}",
+            skipped.len(),
+            skipped.join("; ")
+        );
+    }
 }

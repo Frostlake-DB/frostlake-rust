@@ -10,5 +10,6 @@ repository = "https://github.com/Frostlake-DB/frostlake-rust"
 readme = "README.md"
 keywords = ["frostlake", "sql", "database", "driver", "snowflake"]
 categories = ["database"]
+exclude = ["build.rs", "tests/suites.rs"]
 
 [dependencies]

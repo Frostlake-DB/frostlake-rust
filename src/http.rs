@@ -5,7 +5,7 @@
 
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long each resolved address may take to accept: a plain connect waits
 /// out the OS's SYN retries — about two minutes on Linux — for a host that
@@ -31,6 +31,23 @@ pub fn request(
     request_within(host, port, method, path, json_body, READ_TIMEOUT)
 }
 
+/// [`request`] held to `budget` as a whole: connecting to each address the host
+/// resolves to, sending, and awaiting the answer all draw on it. For courtesy
+/// requests, which must not hold their caller up for long.
+pub fn request_bounded(
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    json_body: Option<&str>,
+    budget: Duration,
+) -> io::Result<Response> {
+    let deadline = Instant::now() + budget;
+    let stream = connect_by(host, port, deadline)?;
+    let remaining = time_left(deadline)?;
+    exchange(stream, host, port, method, path, json_body, remaining, remaining)
+}
+
 fn request_within(
     host: &str,
     port: u16,
@@ -40,9 +57,24 @@ fn request_within(
     read_timeout: Duration,
 ) -> io::Result<Response> {
     let stream = connect(host, port)?;
+    exchange(stream, host, port, method, path, json_body, read_timeout, WRITE_TIMEOUT)
+}
+
+/// Sends one request over `stream` and reads the answer.
+#[allow(clippy::too_many_arguments)]
+fn exchange(
+    stream: TcpStream,
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    json_body: Option<&str>,
+    read_timeout: Duration,
+    write_timeout: Duration,
+) -> io::Result<Response> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(read_timeout))?;
-    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    stream.set_write_timeout(Some(write_timeout))?;
 
     // An IPv6 literal is bracketed in the Host header, URL-style.
     let host_header = if host.contains(':') { format!("[{host}]") } else { host.to_string() };
@@ -82,6 +114,30 @@ fn connect(host: &str, port: u16) -> io::Result<TcpStream> {
     Err(last_error.unwrap_or_else(|| {
         io::Error::new(ErrorKind::NotFound, format!("{host} resolves to no address"))
     }))
+}
+
+/// [`connect`], with every attempt drawing on what is left before `deadline`.
+fn connect_by(host: &str, port: u16, deadline: Instant) -> io::Result<TcpStream> {
+    let mut last_error = None;
+    for address in (host, port).to_socket_addrs()? {
+        let left = time_left(deadline)?;
+        match TcpStream::connect_timeout(&address, left.min(CONNECT_TIMEOUT)) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last_error = Some(e),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(ErrorKind::NotFound, format!("{host} resolves to no address"))
+    }))
+}
+
+/// What is left before `deadline`, or a timeout once nothing is.
+fn time_left(deadline: Instant) -> io::Result<Duration> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(io::Error::new(ErrorKind::TimedOut, "the request's time ran out"));
+    }
+    Ok(left)
 }
 
 fn read_response(mut reader: BufReader<TcpStream>) -> io::Result<Response> {

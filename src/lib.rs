@@ -809,6 +809,8 @@ fn split_statements(sql: &str) -> Vec<&str> {
             i = find_block_comment_end(bytes, i + 2);
         } else if c == b'/' && bytes.get(i + 1) == Some(&b'/') {
             i = skip_line(bytes, i);
+        } else if is_name_start(c) {
+            i = skip_name(bytes, i);
         } else if c == b'$' && bytes.get(i + 1) == Some(&b'$') {
             i = skip_dollar_quoted(bytes, i + 2);
         } else if c == b';' {
@@ -933,6 +935,9 @@ pub fn substitute(sql: &str, binds: &[Value]) -> Result<String, Error> {
             i = find_block_comment_end(bytes, i + 2);
         } else if c == b'/' && bytes.get(i + 1) == Some(&b'/') {
             i = skip_line(bytes, i);
+        } else if is_name_start(c) {
+            // A name is read whole, as the lexer reads one: the $$ in a$$b opens no body.
+            i = skip_name(bytes, i);
         } else if c == b'$' && bytes.get(i + 1) == Some(&b'$') {
             i = skip_dollar_quoted(bytes, i + 2);
         } else if c == b'?' {
@@ -993,11 +998,27 @@ fn skip_quoted(bytes: &[u8], start: usize) -> usize {
     j
 }
 
+/// A line comment ends at a line feed or a carriage return, whichever comes
+/// first, as the lexer's LINE_COMMENT does: `('--' | '//') ~[\r\n]*`.
 fn skip_line(bytes: &[u8], start: usize) -> usize {
-    match bytes[start..].iter().position(|&b| b == b'\n') {
+    match bytes[start..].iter().position(|&b| b == b'\n' || b == b'\r') {
         Some(offset) => start + offset + 1,
         None => bytes.len(),
     }
+}
+
+fn is_name_start(c: u8) -> bool {
+    c == b'_' || c.is_ascii_alphabetic()
+}
+
+/// The end of the name that starts at `start`, read as the lexer reads an
+/// IDENTIFIER: `[a-zA-Z_][a-zA-Z0-9_$]*`.
+fn skip_name(bytes: &[u8], start: usize) -> usize {
+    let mut j = start + 1;
+    while j < bytes.len() && is_word_byte(bytes[j]) {
+        j += 1;
+    }
+    j
 }
 
 fn find_block_comment_end(bytes: &[u8], start: usize) -> usize {
@@ -1416,6 +1437,24 @@ mod tests {
     }
 
     #[test]
+    fn substitution_reads_a_name_whole_so_its_dollars_open_no_body() {
+        let rendered = substitute("SELECT 1 AS a$$b, ?", &[Value::Int(7)]).unwrap();
+        assert_eq!(rendered, "SELECT 1 AS a$$b, 7");
+        let rendered = substitute("SELECT a$$b, $$c?d$$, ?", &[Value::Int(7)]).unwrap();
+        assert_eq!(rendered, "SELECT a$$b, $$c?d$$, 7");
+    }
+
+    #[test]
+    fn substitution_ends_a_line_comment_at_a_carriage_return() {
+        let rendered = substitute("SELECT 1 -- c\r, ?", &[Value::Int(7)]).unwrap();
+        assert_eq!(rendered, "SELECT 1 -- c\r, 7");
+        let rendered = substitute("SELECT 1 // c\r, ?", &[Value::Int(7)]).unwrap();
+        assert_eq!(rendered, "SELECT 1 // c\r, 7");
+        let rendered = substitute("SELECT 1 -- c?\r\n, ?", &[Value::Int(7)]).unwrap();
+        assert_eq!(rendered, "SELECT 1 -- c?\r\n, 7");
+    }
+
+    #[test]
     fn substitution_rejects_bind_count_mismatch() {
         let not_enough = substitute("SELECT ?, ?", &[Value::Int(1)]).unwrap_err();
         assert!(not_enough.to_string().contains("not enough bind values"), "{not_enough}");
@@ -1462,6 +1501,26 @@ mod tests {
         .unwrap();
         assert_eq!(rendered, "SELECT 3-(-5), (-2.5e0::FLOAT)-1, [(-1)]");
         assert_eq!(substitute("SELECT 3-?", &[Value::Int(5)]).unwrap(), "SELECT 3-5");
+    }
+
+    #[test]
+    fn a_negative_bind_stays_one_value_after_a_minus_and_before_a_cast() {
+        for (sql, bind, rendered) in [
+            ("SELECT 3-?", Value::Int(-5), "SELECT 3-(-5)"),
+            ("SELECT ?::VARCHAR", Value::Int(-5), "SELECT (-5)::VARCHAR"),
+            ("SELECT 3-?", Value::Float(-2.5), "SELECT 3-(-2.5e0::FLOAT)"),
+            ("SELECT ?::VARCHAR", Value::Float(-2.5), "SELECT (-2.5e0::FLOAT)::VARCHAR"),
+            (
+                "SELECT 3-?",
+                Value::Int(i128::MIN),
+                "SELECT 3-(-170141183460469231731687303715884105728)",
+            ),
+            // Negative zero is not below zero, but it renders with a minus all the same.
+            ("SELECT 3-?", Value::Float(-0.0), "SELECT 3-(-0e0::FLOAT)"),
+            ("SELECT ?::VARCHAR", Value::Float(-0.0), "SELECT (-0e0::FLOAT)::VARCHAR"),
+        ] {
+            assert_eq!(substitute(sql, &[bind]).unwrap(), rendered, "{sql}");
+        }
     }
 
     #[test]
@@ -1515,6 +1574,7 @@ mod tests {
             "CREATE VOLATILE TABLE t (a INT)",
             "CREATE TEMPORARY STAGE st",
             "  -- comment\n  USE DATABASE x",
+            "-- a line comment ends at a carriage return\rUSE DATABASE x",
             "/* c */ SET v = 1",
         ] {
             assert!(touches_session(statement), "{statement}");
@@ -1571,6 +1631,15 @@ mod tests {
         }
         // Every statement of a request is tracked, a USE behind a SELECT included.
         assert!(split_statements("SELECT 1; USE SCHEMA s").iter().any(|s| touches_session(s)));
+        // A name is read whole, and a line comment ends at a carriage return as at a line feed.
+        assert_eq!(
+            split_statements("SELECT 1 AS a$$b; USE SCHEMA s"),
+            ["SELECT 1 AS a$$b", " USE SCHEMA s"]
+        );
+        assert_eq!(
+            split_statements("SELECT 1 -- c\r; USE SCHEMA s"),
+            ["SELECT 1 -- c\r", " USE SCHEMA s"]
+        );
     }
 
     #[test]

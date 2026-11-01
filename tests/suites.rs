@@ -41,7 +41,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-const RESET: [&str; 4] = [
+// The per-test isolation of testkit SCHEMA.md, in its order. The statement count comes first:
+// cases whose step holds several statements are packs, which the engine refuses unless the
+// session asks for them, and a case may change the count itself, so every test asks again.
+const RESET: [&str; 5] = [
+    "ALTER SESSION SET MULTI_STATEMENT_COUNT = 0",
     "CREATE OR REPLACE DATABASE test_db",
     "USE DATABASE test_db",
     "CREATE OR REPLACE SCHEMA test_schema",
@@ -82,9 +86,6 @@ fn testkit_suites_run_through_this_driver() {
         }
     }
     let mut conn = conn.expect("the engine did not become healthy");
-    // Cases whose step holds several statements are packs, which the engine refuses unless the
-    // session asks for them; the corpus asks once, for any number.
-    let _ = conn.execute("ALTER SESSION SET MULTI_STATEMENT_COUNT = 0", &[]);
 
     let started = Instant::now();
     let mut tsv = String::from("suite\ttest\tstatus\tfailedStep\tdetail\tms\n");
